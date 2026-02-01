@@ -6,3 +6,6 @@ bot.log
 
 # Course materials (cloned separately, not a submodule)
 DSAA3071TheoryOfComputation/
+conversations.db
+conversations.db-shm
+conversations.db-wal

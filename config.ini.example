@@ -40,12 +40,16 @@ VECTOR_STORE_ID = vs_xxxxxxxxxxxx
 # No conversation memory - each message is independent
 
 # =============================================================================
-# DM Mode: Responses API with Conversations
+# DM Mode: Agents SDK with Auto-Compaction
 # =============================================================================
-# DM mode uses OpenAI's Conversations API for automatic context management
-# - Conversations are stored by OpenAI (no manual history management)
+# DM mode uses OpenAI Agents SDK with automatic context compression:
+# - Session history is stored locally in SQLite (configurable)
+# - OpenAIResponsesCompactionSession automatically compresses old history
 # - File search retrieves only relevant course materials (cost-effective)
 # - Use /reset to start a new conversation
+
+# Path to SQLite database for session storage (default: conversations.db)
+# SESSION_DB_PATH = conversations.db
 
 # File patterns to filter which files to upload (comma-separated)
 # Supports glob patterns: "*learning-sheet*", "*validation*"

@@ -1,11 +1,11 @@
 # chatgpt.py
 """
 OpenAI-powered course assistant for DSAA3071 Theory of Computation.
-Uses the modern Responses API (recommended by OpenAI for new projects).
+Uses the OpenAI Agents SDK for automatic context management.
 
 Modes:
-- Stream: RAG mode (vector store search, no chaining)
-- DM: Weekly mode (user specifies week, with chaining)
+- Stream: Responses API with RAG (vector store search, no chaining)
+- DM: Agents SDK with auto-compaction (automatic context compression)
 """
 
 from openai import OpenAI as OpenAIClient
@@ -15,6 +15,11 @@ import os
 import glob
 import fnmatch
 import re
+import asyncio
+
+# OpenAI Agents SDK imports
+from agents import Agent, Runner, SQLiteSession, FileSearchTool
+from agents.memory import OpenAIResponsesCompactionSession
 
 # =============================================================================
 # Model Configuration
@@ -187,16 +192,17 @@ def get_week_context(materials: dict, week_num: int, file_patterns: list = None,
 
 class ChatBot:
     """
-    OpenAI-powered chatbot using the Responses API.
+    OpenAI-powered chatbot using the Agents SDK.
     
     Modes:
     - Stream messages: Responses API with RAG (vector store search, no chaining)
-    - DM messages: Responses API with Conversations (automatic context management)
+    - DM messages: Agents SDK with auto-compaction (automatic context compression)
     """
     
     def __init__(self, model: str, api_key: str, course_dir: str = None, 
                  file_patterns: list = None, vector_store_id: str = None,
-                 max_output_tokens: int = None, log_qa: bool = False):
+                 max_output_tokens: int = None, log_qa: bool = False,
+                 session_db_path: str = "conversations.db"):
         """
         Initialize the chatbot.
         
@@ -208,22 +214,30 @@ class ChatBot:
             vector_store_id: OpenAI Vector Store ID for RAG
             max_output_tokens: Override for max output tokens
             log_qa: Whether to log each Q&A pair
+            session_db_path: Path to SQLite database for session storage
         """
         self.model = model
         self.client = OpenAIClient(api_key=api_key)
         
+        # Set API key for Agents SDK (uses env var)
+        os.environ["OPENAI_API_KEY"] = api_key
+        
         _, default_max_output, encoding_name = get_model_specs(model)
         self.max_output_tokens = max_output_tokens or default_max_output
         self.encoding = tiktoken.get_encoding(encoding_name)
-        
-        # User state for DM mode (Conversations API)
-        self.user_conversations = {}  # user_id -> conversation_id
         
         # OpenAI resources
         self.vector_store_id = vector_store_id
         
         # Logging settings
         self.log_qa = log_qa
+        
+        # Session storage for DM mode (Agents SDK with compaction)
+        self.session_db_path = session_db_path
+        self.user_sessions = {}  # user_id -> OpenAIResponsesCompactionSession
+        
+        # Create Agent for DM mode (with file search tool)
+        self.dm_agent = self._create_dm_agent() if vector_store_id else None
         
         # Course materials (for week detection)
         self.file_patterns = file_patterns or []
@@ -237,19 +251,55 @@ class ChatBot:
         ])
         
         logging.info(f"ChatBot initialized: model={model}")
+        logging.info(f"Using Agents SDK with auto-compaction for DM mode")
         logging.info(f"Available weeks: {self.available_weeks}")
         if vector_store_id:
             logging.info(f"Vector store: {vector_store_id}")
     
+    def _create_dm_agent(self) -> Agent:
+        """Create an Agent for DM mode with file search capability."""
+        return Agent(
+            name="CourseAssistant",
+            model=self.model,
+            instructions=self._get_base_instructions(),
+            tools=[
+                FileSearchTool(
+                    vector_store_ids=[self.vector_store_id],
+                    max_num_results=5,
+                )
+            ],
+        )
+    
+    def _get_user_session(self, user_id: str) -> OpenAIResponsesCompactionSession:
+        """Get or create a compaction session for a user."""
+        if user_id not in self.user_sessions:
+            # Create underlying SQLite session for persistence
+            underlying = SQLiteSession(user_id, self.session_db_path)
+            
+            # Wrap with compaction session for automatic history compression
+            self.user_sessions[user_id] = OpenAIResponsesCompactionSession(
+                session_id=user_id,
+                underlying_session=underlying,
+            )
+            logging.info(f"Created compaction session for user {user_id}")
+        
+        return self.user_sessions[user_id]
+    
     def _get_base_instructions(self) -> str:
         """Base instructions for AI assistant."""
-        return """You are an expert teaching assistant for DSAA3071 Theory of Computation at HKUST(GZ).
+        return """You are a university professor teaching DSAA3071 Theory of Computation at HKUST(GZ).
 
 Your role is to:
 - Help students understand concepts in automata theory, formal languages, and computability
 - Explain DFA, NFA, regular expressions, context-free grammars, pushdown automata, and Turing machines
 - Guide students through proofs and problem-solving techniques
 - Be concise but thorough in explanations
+
+As a professor, you occasionally:
+- Draw connections to related topics (complexity theory, algorithms, programming languages, logic)
+- Share insights from your professional knowledge to inspire deeper thinking
+- Ask thought-provoking questions that encourage students to explore further
+- Mention real-world applications or historical context when relevant
 
 === MATH FORMATTING FOR ZULIP ===
 
@@ -382,18 +432,11 @@ Search for relevant content to answer the question accurately."""
                 mention = ""
             return mention + self._quote_message(quote_text) + f"\n\nError: {str(e)}"
     
-    def _create_conversation(self, user_id: str) -> str:
-        """Create a new conversation for a user and return the conversation ID."""
-        conversation = self.client.conversations.create()
-        self.user_conversations[user_id] = conversation.id
-        logging.info(f"Created conversation {conversation.id} for user {user_id}")
-        return conversation.id
-    
     def get_dm_response(self, user_id: str, prompt: str) -> str:
         """
-        Handle DM message using Responses API with Conversations.
+        Handle DM message using Agents SDK with auto-compaction.
         
-        OpenAI manages conversation context automatically.
+        Uses OpenAIResponsesCompactionSession for automatic context compression.
         File search retrieves relevant course materials per query.
         """
         logging.info(f"DM message from {user_id}")
@@ -402,53 +445,67 @@ Search for relevant content to answer the question accurately."""
         
         # Check for /reset command first - works even without full configuration
         if RESET_PATTERN.match(prompt_stripped):
-            self.user_conversations.pop(user_id, None)
+            self._clear_user_session_sync(user_id)
             return "Conversation cleared. Your next message will start a fresh conversation."
         
         # Check if vector store is configured (needed for file search)
-        if not self.vector_store_id:
+        if not self.vector_store_id or not self.dm_agent:
             return (
                 "**Error:** Vector store not configured.\n\n"
                 "Please run `make upload` to create a vector store, then add `VECTOR_STORE_ID` to config.ini."
             )
         
         try:
-            # Get or create conversation for user
-            conversation_id = self.user_conversations.get(user_id)
-            if not conversation_id:
-                conversation_id = self._create_conversation(user_id)
+            # Get session for user (with auto-compaction)
+            session = self._get_user_session(user_id)
             
-            # Call Responses API with conversation context
-            response = self.client.responses.create(
-                model=self.model,
-                input=prompt,
-                instructions=self._get_base_instructions(),
-                conversation={"id": conversation_id},
-                max_output_tokens=self.max_output_tokens,
-                tools=[{
-                    "type": "file_search",
-                    "vector_store_ids": [self.vector_store_id]
-                }],
-                truncation="auto",
+            # Run agent with session (sync version)
+            result = Runner.run_sync(
+                self.dm_agent,
+                prompt,
+                session=session,
             )
             
-            reply = response.output_text or "I couldn't generate a response."
+            reply = result.final_output or "I couldn't generate a response."
             
             if self.log_qa:
                 logging.info(f"[DM Q&A] User={user_id}\nQ: {prompt}\nA: {reply}")
             
-            return self._format_dm_response(reply, response.usage)
+            # Format response with usage info
+            usage = result.raw_responses[-1].usage if result.raw_responses else None
+            if usage:
+                return self._format_dm_response(reply, usage)
+            else:
+                return f"{reply}\n------\n(Token usage not available)"
             
         except Exception as e:
             logging.error(f"DM response error: {e}")
-            # If conversation is broken, clear it so next message creates a new one
-            if "conversation" in str(e).lower():
-                self.user_conversations.pop(user_id, None)
+            # If session is broken, clear it so next message creates a new one
+            if "session" in str(e).lower() or "conversation" in str(e).lower():
+                self._clear_user_session_sync(user_id)
             return f"Error: {str(e)}"
     
+    def _clear_user_session_sync(self, user_id: str):
+        """Clear a user's session synchronously."""
+        if user_id in self.user_sessions:
+            session = self.user_sessions[user_id]
+            # Run async clear in sync context
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Create a new loop for sync context
+                    asyncio.run(session.clear_session())
+                else:
+                    loop.run_until_complete(session.clear_session())
+            except RuntimeError:
+                # No event loop, create one
+                asyncio.run(session.clear_session())
+            del self.user_sessions[user_id]
+            logging.info(f"Cleared session for user {user_id}")
+    
     def clear_user_session(self, user_id: str):
-        """Clear a user's session (conversation)."""
-        self.user_conversations.pop(user_id, None)
+        """Clear a user's session."""
+        self._clear_user_session_sync(user_id)
 
 
 # Alias for backward compatibility

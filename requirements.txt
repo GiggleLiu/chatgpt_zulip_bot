@@ -1,5 +1,6 @@
 zulip
 openai >= 1.0.0
+openai-agents >= 0.1.0
 requests
 tiktoken
 pytest

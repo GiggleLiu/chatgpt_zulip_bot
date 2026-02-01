@@ -215,24 +215,28 @@ def test_chatbot_token_counting():
         assert isinstance(tokens, int)
 
 
-def test_chatbot_conversations_api_call():
-    """Test that the bot calls the Conversations API correctly for DM mode."""
-    with patch('chatgpt.OpenAIClient') as MockClient:
+def test_chatbot_agents_sdk_call():
+    """Test that the bot calls the Agents SDK correctly for DM mode."""
+    with patch('chatgpt.OpenAIClient') as MockClient, \
+         patch('chatgpt.Runner') as MockRunner, \
+         patch('chatgpt.SQLiteSession') as MockSQLiteSession, \
+         patch('chatgpt.OpenAIResponsesCompactionSession') as MockCompactionSession:
+        
         mock_client = MagicMock()
         MockClient.return_value = mock_client
         
-        # Mock conversation creation
-        mock_conversation = MagicMock()
-        mock_conversation.id = "conv_123"
-        mock_client.conversations.create.return_value = mock_conversation
+        # Mock session
+        mock_session = MagicMock()
+        MockCompactionSession.return_value = mock_session
         
-        # Mock response
-        mock_response = MagicMock()
-        mock_response.output_text = "This is a test response about DFA."
-        mock_response.usage.input_tokens = 100
-        mock_response.usage.output_tokens = 50
-        mock_response.usage.total_tokens = 150
-        mock_client.responses.create.return_value = mock_response
+        # Mock runner result
+        mock_result = MagicMock()
+        mock_result.final_output = "This is a test response about DFA."
+        mock_result.raw_responses = [MagicMock()]
+        mock_result.raw_responses[0].usage.input_tokens = 100
+        mock_result.raw_responses[0].usage.output_tokens = 50
+        mock_result.raw_responses[0].usage.total_tokens = 150
+        MockRunner.run_sync.return_value = mock_result
         
         bot = ChatBot(model="gpt-4o", api_key="fake-key", vector_store_id="vs_123")
         
@@ -242,69 +246,67 @@ def test_chatbot_conversations_api_call():
         assert "test response" in result
         assert "Tokens:" in result
         
-        # Verify conversation was created
-        mock_client.conversations.create.assert_called_once()
+        # Verify Runner.run_sync was called
+        MockRunner.run_sync.assert_called_once()
+        call_kwargs = MockRunner.run_sync.call_args.kwargs
+        assert call_kwargs["session"] == mock_session
+
+
+def test_chatbot_session_reuse():
+    """Test that sessions are reused for multi-turn conversations."""
+    with patch('chatgpt.OpenAIClient') as MockClient, \
+         patch('chatgpt.Runner') as MockRunner, \
+         patch('chatgpt.SQLiteSession') as MockSQLiteSession, \
+         patch('chatgpt.OpenAIResponsesCompactionSession') as MockCompactionSession:
         
-        # Verify responses.create was called with conversation
-        mock_client.responses.create.assert_called_once()
-        call_kwargs = mock_client.responses.create.call_args.kwargs
-        assert call_kwargs["conversation"] == {"id": "conv_123"}
-        assert call_kwargs["input"] == "What is a DFA?"
-
-
-def test_chatbot_conversation_reuse():
-    """Test that conversations are reused for multi-turn conversations."""
-    with patch('chatgpt.OpenAIClient') as MockClient:
         mock_client = MagicMock()
         MockClient.return_value = mock_client
         
-        # Mock conversation creation (only called once)
-        mock_conversation = MagicMock()
-        mock_conversation.id = "conv_123"
-        mock_client.conversations.create.return_value = mock_conversation
+        # Mock session
+        mock_session = MagicMock()
+        MockCompactionSession.return_value = mock_session
         
-        # Mock response
-        mock_response = MagicMock()
-        mock_response.output_text = "Response"
-        mock_response.usage.input_tokens = 100
-        mock_response.usage.output_tokens = 50
-        mock_response.usage.total_tokens = 150
-        mock_client.responses.create.return_value = mock_response
+        # Mock runner result
+        mock_result = MagicMock()
+        mock_result.final_output = "Response"
+        mock_result.raw_responses = [MagicMock()]
+        mock_result.raw_responses[0].usage.input_tokens = 100
+        mock_result.raw_responses[0].usage.output_tokens = 50
+        mock_result.raw_responses[0].usage.total_tokens = 150
+        MockRunner.run_sync.return_value = mock_result
         
         bot = ChatBot(model="gpt-4o", api_key="fake-key", vector_store_id="vs_123")
         
-        # First message - should create conversation
+        # First message - should create session
         bot.get_dm_response("user1", "Hello")
-        assert "user1" in bot.user_conversations
-        assert bot.user_conversations["user1"] == "conv_123"
+        assert "user1" in bot.user_sessions
         
-        # Second message - should reuse same conversation
+        # Second message - should reuse same session
         bot.get_dm_response("user1", "Follow up question")
         
-        # Conversation should only be created once
-        assert mock_client.conversations.create.call_count == 1
+        # Session should only be created once (MockCompactionSession called once per user)
+        assert MockCompactionSession.call_count == 1
         
-        # But responses.create should be called twice
-        assert mock_client.responses.create.call_count == 2
-        
-        # Both calls should use the same conversation
-        for call in mock_client.responses.create.call_args_list:
-            assert call.kwargs["conversation"] == {"id": "conv_123"}
+        # But Runner.run_sync should be called twice
+        assert MockRunner.run_sync.call_count == 2
 
 
 def test_chatbot_error_handling():
-    """Test error handling when Responses API fails."""
-    with patch('chatgpt.OpenAIClient') as MockClient:
+    """Test error handling when Agents SDK fails."""
+    with patch('chatgpt.OpenAIClient') as MockClient, \
+         patch('chatgpt.Runner') as MockRunner, \
+         patch('chatgpt.SQLiteSession') as MockSQLiteSession, \
+         patch('chatgpt.OpenAIResponsesCompactionSession') as MockCompactionSession:
+        
         mock_client = MagicMock()
         MockClient.return_value = mock_client
         
-        # Mock conversation creation
-        mock_conversation = MagicMock()
-        mock_conversation.id = "conv_123"
-        mock_client.conversations.create.return_value = mock_conversation
+        # Mock session
+        mock_session = MagicMock()
+        MockCompactionSession.return_value = mock_session
         
-        # Make responses.create fail
-        mock_client.responses.create.side_effect = Exception("API error")
+        # Make Runner.run_sync fail
+        MockRunner.run_sync.side_effect = Exception("API error")
         
         bot = ChatBot(model="gpt-4o", api_key="fake-key", vector_store_id="vs_123")
         
@@ -325,17 +327,21 @@ def chatbot_with_api():
     if not api_key:
         pytest.skip("OPENAI_API_KEY environment variable not set")
     
+    vector_store_id = os.environ.get("VECTOR_STORE_ID")
+    if not vector_store_id:
+        pytest.skip("VECTOR_STORE_ID environment variable not set")
+    
     model = os.environ.get("MODEL", "gpt-4o")
-    return ChatBot(model=model, api_key=api_key)
+    return ChatBot(model=model, api_key=api_key, vector_store_id=vector_store_id)
 
 
 def test_real_api_response(chatbot_with_api):
     """Test actual API response (requires API key)."""
-    response = chatbot_with_api.get_response("test_user", "What is a DFA? Answer in one sentence.")
+    response = chatbot_with_api.get_dm_response("test_user", "What is a DFA? Answer in one sentence.")
     assert isinstance(response, str)
     assert len(response) > 0
     # Clean up
-    chatbot_with_api.user_conversations.pop("test_user", None)
+    chatbot_with_api.clear_user_session("test_user")
 
 
 # =============================================================================

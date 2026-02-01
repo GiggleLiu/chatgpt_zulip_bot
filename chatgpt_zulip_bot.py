@@ -223,6 +223,9 @@ def serve(config_file: str = "config.ini"):
     # Optional: log Q&A pairs (default: true)
     log_qa = settings.get("LOG_QA", "true").lower() in ("true", "1", "yes")
     
+    # Optional: session database path for Agents SDK (default: conversations.db)
+    session_db_path = settings.get("SESSION_DB_PATH", "conversations.db")
+    
     # Zulip settings
     zulip_config = settings["ZULIP_CONFIG"]
     user_id = int(settings["USER_ID"])
@@ -244,6 +247,7 @@ def serve(config_file: str = "config.ini"):
         vector_store_id=vector_store_id,
         max_output_tokens=max_output_tokens,
         log_qa=log_qa,
+        session_db_path=session_db_path,
     )
     
     # Initialize Zulip bot
@@ -255,8 +259,9 @@ def serve(config_file: str = "config.ini"):
     # Print startup info
     print(f"ChatGPT bot starting (model: {model})")
     print(f"  Stream mode: Responses API + RAG")
-    print(f"  DM mode: Responses API + Conversations")
+    print(f"  DM mode: Agents SDK + Auto-Compaction")
     print(f"  Vector store: {vector_store_id or 'NOT SET'}")
+    print(f"  Session DB: {session_db_path}")
     print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
     
     if allowed_streams:
