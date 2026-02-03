@@ -205,7 +205,7 @@ def serve(config_file: str = "config.ini"):
     
     # OpenAI settings
     api_key = settings["OPENAI_API_KEY"]
-    model = settings.get("MODEL") or settings.get("API_VERSION", "gpt-4o")
+    model = settings["MODEL"]
     course_dir = settings.get("COURSE_DIR")
     
     # File patterns to filter course materials (comma-separated)

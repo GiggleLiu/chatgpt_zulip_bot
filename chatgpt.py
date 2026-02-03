@@ -259,7 +259,7 @@ class ChatBot:
     def _create_dm_agent(self) -> Agent:
         """Create an Agent for DM mode with file search capability."""
         return Agent(
-            name="CourseAssistant",
+            name="Professor-GPT",
             model=self.model,
             instructions=self._get_base_instructions(),
             tools=[
