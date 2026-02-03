@@ -1,7 +1,11 @@
 # chatgpt_zulip_bot.py
 """
-Zulip bot that integrates with OpenAI for course assistance.
+Zulip bot that integrates with OpenAI or Claude for course assistance.
 Restricted to specific streams and their members.
+
+Supports two backends:
+- OpenAI: Uses Agents SDK with RAG (vector store search)
+- Claude: Uses context stuffing (all materials in prompt)
 """
 
 import zulip
@@ -11,6 +15,7 @@ import logging
 from configparser import ConfigParser
 
 from chatgpt import ChatBot
+from claude import ClaudeChatBot
 
 
 class ChatGPTZulipBot(zulip.Client):
@@ -203,17 +208,16 @@ def serve(config_file: str = "config.ini"):
     config.read(config_file)
     settings = config["settings"]
     
-    # OpenAI settings
-    api_key = settings["OPENAI_API_KEY"]
+    # Backend selection: "openai" or "claude" (default: openai)
+    backend = settings.get("BACKEND", "openai").lower().strip()
+    
+    # Model and course settings
     model = settings["MODEL"]
     course_dir = settings.get("COURSE_DIR")
     
     # File patterns to filter course materials (comma-separated)
     file_patterns_str = settings.get("FILE_PATTERNS", "")
     file_patterns = [p.strip() for p in file_patterns_str.split(",") if p.strip()]
-    
-    # Vector store ID for RAG (both modes)
-    vector_store_id = settings.get("VECTOR_STORE_ID")
     
     # Optional: override auto-detected max tokens
     max_output_tokens = None
@@ -222,9 +226,6 @@ def serve(config_file: str = "config.ini"):
     
     # Optional: log Q&A pairs (default: true)
     log_qa = settings.get("LOG_QA", "true").lower() in ("true", "1", "yes")
-    
-    # Optional: session database path for Agents SDK (default: conversations.db)
-    session_db_path = settings.get("SESSION_DB_PATH", "conversations.db")
     
     # Zulip settings
     zulip_config = settings["ZULIP_CONFIG"]
@@ -238,17 +239,54 @@ def serve(config_file: str = "config.ini"):
     if allowed_streams_str:
         allowed_streams = [s.strip() for s in allowed_streams_str.split(",") if s.strip()]
     
-    # Initialize chatbot
-    chatbot = ChatBot(
-        model=model,
-        api_key=api_key,
-        course_dir=course_dir,
-        file_patterns=file_patterns,
-        vector_store_id=vector_store_id,
-        max_output_tokens=max_output_tokens,
-        log_qa=log_qa,
-        session_db_path=session_db_path,
-    )
+    # Initialize chatbot based on backend
+    if backend == "claude":
+        # Claude backend: context stuffing (no vector store needed)
+        api_key = settings["ANTHROPIC_API_KEY"]
+        
+        chatbot = ClaudeChatBot(
+            model=model,
+            api_key=api_key,
+            course_dir=course_dir,
+            file_patterns=file_patterns,
+            max_output_tokens=max_output_tokens,
+            log_qa=log_qa,
+        )
+        
+        # Print startup info for Claude
+        print(f"Claude bot starting (model: {model})")
+        print(f"  Backend: Claude (context stuffing)")
+        print(f"  Course context: {len(chatbot.course_context):,} chars")
+        print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
+    else:
+        # OpenAI backend: RAG with vector store
+        api_key = settings["OPENAI_API_KEY"]
+        vector_store_id = settings.get("VECTOR_STORE_ID")
+        session_db_path = settings.get("SESSION_DB_PATH", "conversations.db")
+        
+        chatbot = ChatBot(
+            model=model,
+            api_key=api_key,
+            course_dir=course_dir,
+            file_patterns=file_patterns,
+            vector_store_id=vector_store_id,
+            max_output_tokens=max_output_tokens,
+            log_qa=log_qa,
+            session_db_path=session_db_path,
+        )
+        
+        # Print startup info for OpenAI
+        print(f"OpenAI bot starting (model: {model})")
+        print(f"  Backend: OpenAI (Agents SDK + RAG)")
+        print(f"  Stream mode: Responses API + RAG")
+        print(f"  DM mode: Agents SDK + Auto-Compaction")
+        print(f"  Vector store: {vector_store_id or 'NOT SET'}")
+        print(f"  Session DB: {session_db_path}")
+        print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
+        
+        if not vector_store_id:
+            print("\n⚠️  WARNING: VECTOR_STORE_ID not set. RAG/file search will not work.")
+            print("   Run 'make upload' to create a vector store.\n")
     
     # Initialize Zulip bot
     bot = ChatGPTZulipBot(
@@ -256,23 +294,11 @@ def serve(config_file: str = "config.ini"):
         allowed_streams=allowed_streams
     )
     
-    # Print startup info
-    print(f"ChatGPT bot starting (model: {model})")
-    print(f"  Stream mode: Responses API + RAG")
-    print(f"  DM mode: Agents SDK + Auto-Compaction")
-    print(f"  Vector store: {vector_store_id or 'NOT SET'}")
-    print(f"  Session DB: {session_db_path}")
-    print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
-    
     if allowed_streams:
         print(f"  Access restricted to: {', '.join(allowed_streams)}")
         print(f"  Authorized users: {len(bot.allowed_users)}")
     
-    if not vector_store_id:
-        print("\n⚠️  WARNING: VECTOR_STORE_ID not set. RAG/file search will not work.")
-        print("   Run 'make upload' to create a vector store.\n")
-    
-    bot.send_notification("NOTICE: The ChatGPT bot is now online.")
+    bot.send_notification(f"NOTICE: The {backend.capitalize()} bot is now online.")
     print("Bot is now online and listening for messages...")
     
     atexit.register(on_exit, bot)

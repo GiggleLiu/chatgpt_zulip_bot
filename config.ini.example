@@ -1,12 +1,31 @@
 [settings]
 # =============================================================================
-# OpenAI Configuration
+# Backend Selection: "openai" or "claude"
+# =============================================================================
+# - openai: Uses Agents SDK with RAG (vector store search)
+# - claude: Uses context stuffing (all materials in prompt, simpler setup)
+BACKEND = openai
+
+# =============================================================================
+# OpenAI Configuration (required if BACKEND = openai)
 # =============================================================================
 OPENAI_API_KEY = YOUR_OPENAI_API_KEY
 
-# Model name (e.g., gpt-5.2, gpt-4o, gpt-4-turbo, o1-mini)
-# Used for both Stream mode and DM mode
+# =============================================================================
+# Claude/Anthropic Configuration (required if BACKEND = claude)
+# =============================================================================
+# ANTHROPIC_API_KEY = YOUR_ANTHROPIC_API_KEY
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+# OpenAI models: gpt-5.2, gpt-4o, gpt-4-turbo, o1-mini
+# Claude models (recommended): claude-sonnet-4-5-20250929 (latest Sonnet 4.5)
+#   Other options: claude-opus-4-5-20251101, claude-haiku-4-5-20251001
+#
+# For Claude backend, we recommend claude-sonnet-4-5-20250929 for best accuracy
 MODEL = gpt-4o
+# MODEL = claude-sonnet-4-5-20250929
 
 # =============================================================================
 # Zulip Configuration
@@ -28,28 +47,56 @@ ALLOWED_STREAMS = DSAA3071-2026-Spring, Teaching-DSAA3071-2026-Spring
 COURSE_DIR = DSAA3071TheoryOfComputation
 
 # =============================================================================
-# OpenAI Resources (created by: make upload)
+# OpenAI Resources (only needed if BACKEND = openai)
 # =============================================================================
-# Vector store ID - used for RAG file search in both modes
+# Vector store ID - used for RAG file search (created by: make upload)
 VECTOR_STORE_ID = vs_xxxxxxxxxxxx
-
-# =============================================================================
-# Stream Mode: RAG (Retrieval-Augmented Generation)
-# =============================================================================
-# Stream messages use the vector store to search relevant content per query
-# No conversation memory - each message is independent
-
-# =============================================================================
-# DM Mode: Agents SDK with Auto-Compaction
-# =============================================================================
-# DM mode uses OpenAI Agents SDK with automatic context compression:
-# - Session history is stored locally in SQLite (configurable)
-# - OpenAIResponsesCompactionSession automatically compresses old history
-# - File search retrieves only relevant course materials (cost-effective)
-# - Use /reset to start a new conversation
 
 # Path to SQLite database for session storage (default: conversations.db)
 # SESSION_DB_PATH = conversations.db
+
+# =============================================================================
+# OpenAI Mode Details (BACKEND = openai)
+# =============================================================================
+# Stream Mode: Responses API + RAG
+# - Uses vector store to search relevant content per query
+# - No conversation memory - each message is independent
+#
+# DM Mode: Agents SDK + Auto-Compaction  
+# - Session history stored in SQLite
+# - Automatic context compression for long conversations
+# - File search retrieves relevant course materials
+# - Use /reset to start a new conversation
+
+# =============================================================================
+# Claude Mode Details (BACKEND = claude)
+# =============================================================================
+#
+# STREAM MODE (public channels):
+# - NO course materials loaded (keeps costs low)
+# - Answers general theory of computation questions from AI knowledge
+# - For course-specific questions, suggests student DM with /week N
+#
+# DM MODE (private messages):
+# - Students MUST select a week first with /week N
+# - Only that week's materials are loaded (~6K tokens instead of 80K)
+# - Prompt caching reduces costs by ~90% for follow-up questions
+# - Maintains conversation history per user
+#
+# Student Commands (DM mode only):
+# - /week N  - Select which week to study (e.g., /week 3)
+# - /reset   - Clear conversation and week selection
+#
+# Claude Sonnet 4.5 is recommended for:
+# - Best accuracy on mathematical proofs and formal definitions
+# - Careful, verified responses that cite course materials
+# - Clear indication when information is outside course scope
+#
+# Cost efficiency (DM mode):
+# - Week-based: ~6K tokens/query vs 80K (13x reduction)
+# - Prompt caching: 90% savings on cached context
+# - Combined: ~99% cost reduction for follow-up questions
+# - Stream mode: ~1K tokens/query (no course materials)
 
 # File patterns to filter which files to upload (comma-separated)
 # Supports glob patterns: "*learning-sheet*", "*validation*"

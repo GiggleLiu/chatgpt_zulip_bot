@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.40.0",
     "openai>=2.16.0",
     "openai-agents>=0.7.0",
     "pytest>=9.0.2",
