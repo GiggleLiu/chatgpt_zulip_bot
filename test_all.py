@@ -9,6 +9,7 @@ import tiktoken
 
 from chatgpt import (
     ChatBot,
+    GeneratedFile,
     get_model_specs,
     load_course_materials,
     extract_text_content,
@@ -633,3 +634,635 @@ new question'''
             assert "````quote" in result
             assert "Hello" in result
             assert "Hi there!" in result
+
+
+# =============================================================================
+# Generated File Tests
+# =============================================================================
+
+class TestGeneratedFiles:
+    """Test generated file handling from CodeInterpreter."""
+    
+    def test_generated_file_dataclass(self):
+        """Test GeneratedFile dataclass creation."""
+        file = GeneratedFile(
+            filename="plot.png",
+            content=b"\x89PNG\r\n\x1a\n",  # PNG header bytes
+            mime_type="image/png"
+        )
+        assert file.filename == "plot.png"
+        assert file.content == b"\x89PNG\r\n\x1a\n"
+        assert file.mime_type == "image/png"
+    
+    def test_generated_file_default_mime_type(self):
+        """Test GeneratedFile default mime type."""
+        file = GeneratedFile(
+            filename="data.bin",
+            content=b"binary data"
+        )
+        assert file.mime_type == "application/octet-stream"
+    
+    def test_file_uploader_callback(self):
+        """Test that file_uploader callback is called correctly."""
+        uploaded_files = []
+        
+        def mock_uploader(filename: str, content: bytes) -> str:
+            uploaded_files.append((filename, content))
+            return f"/uploads/{filename}"
+        
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            # Mock result with no files (simpler test)
+            mock_result = MagicMock()
+            mock_result.final_output = "Here's a plot."
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].usage.input_tokens = 100
+            mock_result.raw_responses[0].usage.output_tokens = 50
+            mock_result.raw_responses[0].usage.total_tokens = 150
+            mock_result.raw_responses[0].output = []  # No code interpreter output
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                vector_store_id="vs_123",
+                file_uploader=mock_uploader
+            )
+            
+            # Test that bot was initialized with file_uploader
+            assert bot.file_uploader == mock_uploader
+            
+            # Run a response (no files generated in this case)
+            result = bot.get_dm_response("user@test.com", "Generate a plot")
+            assert "Here's a plot" in result
+    
+    def test_extract_generated_files_empty(self):
+        """Test file extraction when no files are generated."""
+        with patch('chatgpt.OpenAIClient') as MockClient:
+            MockClient.return_value = MagicMock()
+            
+            bot = ChatBot(model="gpt-4o", api_key="fake-key")
+            
+            # Mock result with no code interpreter output
+            mock_result = MagicMock()
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].output = []
+            
+            files = bot._extract_generated_files(mock_result)
+            assert files == []
+    
+    def test_extract_generated_files_with_code_interpreter_output(self):
+        """Test file extraction from code interpreter results."""
+        with patch('chatgpt.OpenAIClient') as MockClient:
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            
+            # Mock file content response
+            mock_content_response = MagicMock()
+            mock_content_response.read.return_value = b"fake image bytes"
+            mock_client.containers.files.content.return_value = mock_content_response
+            
+            bot = ChatBot(model="gpt-4o", api_key="fake-key")
+            
+            # Mock result with code interpreter file output
+            mock_file_info = MagicMock()
+            mock_file_info.container_id = "cntr_123"
+            mock_file_info.file_id = "file_456"
+            mock_file_info.filename = "plot.png"
+            mock_file_info.mime_type = "image/png"
+            
+            mock_code_result = MagicMock()
+            mock_code_result.type = "files"
+            mock_code_result.files = [mock_file_info]
+            
+            mock_code_item = MagicMock()
+            mock_code_item.type = "code_interpreter_call"
+            mock_code_item.results = [mock_code_result]
+            
+            mock_response = MagicMock()
+            mock_response.output = [mock_code_item]
+            
+            mock_result = MagicMock()
+            mock_result.raw_responses = [mock_response]
+            
+            files = bot._extract_generated_files(mock_result)
+            
+            assert len(files) == 1
+            assert files[0].filename == "plot.png"
+            assert files[0].content == b"fake image bytes"
+            assert files[0].mime_type == "image/png"
+            
+            # Verify the container API was called
+            mock_client.containers.files.content.assert_called_once_with(
+                container_id="cntr_123",
+                file_id="file_456"
+            )
+    
+    def test_dm_response_with_generated_images(self):
+        """Test DM response includes uploaded images."""
+        uploaded_files = []
+        
+        def mock_uploader(filename: str, content: bytes) -> str:
+            uploaded_files.append(filename)
+            return f"/user_uploads/{filename}"
+        
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            # Mock file content download
+            mock_content_response = MagicMock()
+            mock_content_response.read.return_value = b"fake png bytes"
+            mock_client.containers.files.content.return_value = mock_content_response
+            
+            # Build mock result with code interpreter file
+            mock_file_info = MagicMock()
+            mock_file_info.container_id = "cntr_abc"
+            mock_file_info.file_id = "file_xyz"
+            mock_file_info.filename = "chart.png"
+            mock_file_info.mime_type = "image/png"
+            
+            mock_code_result = MagicMock()
+            mock_code_result.type = "files"
+            mock_code_result.files = [mock_file_info]
+            
+            mock_code_item = MagicMock()
+            mock_code_item.type = "code_interpreter_call"
+            mock_code_item.results = [mock_code_result]
+            
+            mock_response = MagicMock()
+            mock_response.output = [mock_code_item]
+            mock_response.usage.input_tokens = 200
+            mock_response.usage.output_tokens = 100
+            mock_response.usage.total_tokens = 300
+            
+            mock_result = MagicMock()
+            mock_result.final_output = "Here is the chart you requested."
+            mock_result.raw_responses = [mock_response]
+            
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                vector_store_id="vs_123",
+                file_uploader=mock_uploader
+            )
+            
+            result = bot.get_dm_response("user@test.com", "Create a bar chart", user_name="Test User")
+            
+            # Check that the image was uploaded
+            assert "chart.png" in uploaded_files
+            
+            # Check that the response includes the image markdown
+            # Zulip uses [filename](url) syntax, not ![filename](url)
+            # Zulip auto-generates image previews for image links
+            assert "[chart.png](/user_uploads/chart.png)" in result
+            assert "Here is the chart you requested." in result
+            assert "Tokens:" in result
+    
+    def test_dm_response_with_user_name_logging(self):
+        """Test that DM response logs user name when provided."""
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession, \
+             patch('chatgpt.logging') as mock_logging:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            mock_result = MagicMock()
+            mock_result.final_output = "Response"
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].usage.input_tokens = 100
+            mock_result.raw_responses[0].usage.output_tokens = 50
+            mock_result.raw_responses[0].usage.total_tokens = 150
+            mock_result.raw_responses[0].output = []
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(model="gpt-4o", api_key="fake-key", vector_store_id="vs_123")
+            
+            bot.get_dm_response("user@example.com", "Hello", user_name="John Doe")
+            
+            # Check that logging.info was called with user name
+            calls = [str(c) for c in mock_logging.info.call_args_list]
+            # At least one call should contain "John Doe"
+            assert any("John Doe" in c for c in calls)
+
+
+class TestFileInput:
+    """Tests for user-uploaded file processing (images and PDFs)."""
+    
+    def test_extract_files_no_downloader(self):
+        """Test that no files are extracted when file_downloader is not set."""
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=None
+            )
+            
+            message = "Check this image /user_uploads/2/f8/abc123/test.png please"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            assert cleaned == message  # Unchanged
+            assert files == []
+    
+    def test_extract_files_no_files(self):
+        """Test message with no files returns unchanged."""
+        def mock_downloader(path):
+            return b"data"
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Just a plain text message"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            assert cleaned == message
+            assert files == []
+    
+    def test_extract_files_with_image(self):
+        """Test extracting an image URL from a message."""
+        downloaded_files = []
+        
+        def mock_downloader(path):
+            downloaded_files.append(path)
+            # Return fake PNG bytes
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Check this image /user_uploads/2/f8/abc123/test.png please"
+            cleaned, files = bot._extract_files_from_message(message, "test_user")
+            
+            # Verify the file was downloaded
+            assert "/user_uploads/2/f8/abc123/test.png" in downloaded_files
+            
+            # Verify the message was cleaned
+            assert "[attached image: test.png]" in cleaned
+            assert "/user_uploads/" not in cleaned
+            
+            # Verify image content was extracted
+            assert len(files) == 1
+            assert files[0]["type"] == "input_image"
+            assert files[0]["image_url"].startswith("data:image/png;base64,")
+    
+    def test_extract_files_multiple_images(self):
+        """Test extracting multiple image URLs from a message."""
+        def mock_downloader(path):
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "First: /user_uploads/2/a1/img1.png and second: /user_uploads/2/b2/img2.jpg"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            assert len(files) == 2
+            assert "[attached image: img1.png]" in cleaned
+            assert "[attached image: img2.jpg]" in cleaned
+    
+    def test_extract_files_with_pdf(self):
+        """Test extracting a PDF URL from a message."""
+        downloaded_files = []
+        
+        def mock_downloader(path):
+            downloaded_files.append(path)
+            # Return fake PDF bytes
+            return b"%PDF-1.4" + b"\x00" * 100
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Check this document /user_uploads/2/f8/abc123/report.pdf please"
+            cleaned, files = bot._extract_files_from_message(message, "test_user")
+            
+            # Verify the file was downloaded
+            assert "/user_uploads/2/f8/abc123/report.pdf" in downloaded_files
+            
+            # Verify the message was cleaned
+            assert "[attached document: report.pdf]" in cleaned
+            assert "/user_uploads/" not in cleaned
+            
+            # Verify PDF content was extracted with correct format
+            assert len(files) == 1
+            assert files[0]["type"] == "input_file"
+            assert files[0]["filename"] == "report.pdf"
+            assert files[0]["file_data"].startswith("data:application/pdf;base64,")
+    
+    def test_extract_files_mixed_image_and_pdf(self):
+        """Test extracting both image and PDF from a message."""
+        def mock_downloader(path):
+            if path.endswith('.pdf'):
+                return b"%PDF-1.4" + b"\x00" * 50
+            else:
+                return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Image: /user_uploads/2/a1/photo.png and PDF: /user_uploads/2/b2/doc.pdf"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # Both should be extracted
+            assert len(files) == 2
+            
+            # Check image
+            image_file = next(f for f in files if f["type"] == "input_image")
+            assert image_file["image_url"].startswith("data:image/png;base64,")
+            
+            # Check PDF
+            pdf_file = next(f for f in files if f["type"] == "input_file")
+            assert pdf_file["filename"] == "doc.pdf"
+            assert pdf_file["file_data"].startswith("data:application/pdf;base64,")
+            
+            # Check cleaned message
+            assert "[attached image: photo.png]" in cleaned
+            assert "[attached document: doc.pdf]" in cleaned
+    
+    def test_extract_files_with_various_documents(self):
+        """Test extracting various document types (docx, csv, txt, etc.)."""
+        downloaded = []
+        
+        def mock_downloader(path):
+            downloaded.append(path)
+            return b"document content"
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Word: /user_uploads/2/a1/report.docx CSV: /user_uploads/2/a1/data.csv Text: /user_uploads/2/a1/notes.txt"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # All should be downloaded
+            assert len(downloaded) == 3
+            assert "/user_uploads/2/a1/report.docx" in downloaded
+            assert "/user_uploads/2/a1/data.csv" in downloaded
+            assert "/user_uploads/2/a1/notes.txt" in downloaded
+            
+            # All should be extracted as input_file
+            assert len(files) == 3
+            for f in files:
+                assert f["type"] == "input_file"
+                assert "filename" in f
+                assert "file_data" in f
+            
+            # Check MIME types
+            docx_file = next(f for f in files if f["filename"] == "report.docx")
+            assert "vnd.openxmlformats" in docx_file["file_data"]
+            
+            csv_file = next(f for f in files if f["filename"] == "data.csv")
+            assert "text/csv" in csv_file["file_data"]
+            
+            txt_file = next(f for f in files if f["filename"] == "notes.txt")
+            assert "text/plain" in txt_file["file_data"]
+            
+            # Check cleaned message
+            assert "[attached document: report.docx]" in cleaned
+            assert "[attached document: data.csv]" in cleaned
+            assert "[attached document: notes.txt]" in cleaned
+    
+    def test_extract_files_skip_unsupported(self):
+        """Test that unsupported file types are skipped."""
+        downloaded = []
+        
+        def mock_downloader(path):
+            downloaded.append(path)
+            return b"data"
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            # .zip and .exe are not supported
+            message = "See /user_uploads/2/a1/archive.zip and /user_uploads/2/a1/img.png and /user_uploads/2/a1/app.exe"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # Only PNG should be downloaded
+            assert "/user_uploads/2/a1/img.png" in downloaded
+            assert "/user_uploads/2/a1/archive.zip" not in downloaded
+            assert "/user_uploads/2/a1/app.exe" not in downloaded
+            
+            # Only one file should be extracted
+            assert len(files) == 1
+            
+            # Unsupported URLs should remain in message
+            assert "/user_uploads/2/a1/archive.zip" in cleaned
+            assert "/user_uploads/2/a1/app.exe" in cleaned
+    
+    def test_extract_files_download_failure(self):
+        """Test handling of download failures."""
+        def mock_downloader(path):
+            return None  # Simulate download failure
+        
+        with patch('chatgpt.OpenAIClient'):
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                file_downloader=mock_downloader
+            )
+            
+            message = "Check /user_uploads/2/a1/test.png"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # No files extracted on failure
+            assert files == []
+            # Original URL should remain (not replaced)
+            assert "/user_uploads/2/a1/test.png" in cleaned
+    
+    def test_dm_response_with_input_image(self):
+        """Test DM response handles user-uploaded images (multimodal input)."""
+        def mock_downloader(path):
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            mock_result = MagicMock()
+            mock_result.final_output = "I can see the image you uploaded. It shows a graph."
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].usage.input_tokens = 500
+            mock_result.raw_responses[0].usage.output_tokens = 100
+            mock_result.raw_responses[0].usage.total_tokens = 600
+            mock_result.raw_responses[0].output = []
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                vector_store_id="vs_123",
+                file_downloader=mock_downloader
+            )
+            
+            result = bot.get_dm_response(
+                "user@test.com", 
+                "What's in this image? /user_uploads/2/f8/abc/chart.png",
+                user_name="Test User"
+            )
+            
+            # Verify Runner.run_sync was called with multimodal input
+            call_args = MockRunner.run_sync.call_args
+            agent_input = call_args[0][1]  # Second positional arg is input
+            
+            # Should be a list (multimodal input)
+            assert isinstance(agent_input, list)
+            assert len(agent_input) == 1
+            assert agent_input[0]["role"] == "user"
+            
+            content = agent_input[0]["content"]
+            # Should have text + image parts
+            assert any(c["type"] == "input_text" for c in content)
+            assert any(c["type"] == "input_image" for c in content)
+            
+            # The text part should have the cleaned message
+            text_part = next(c for c in content if c["type"] == "input_text")
+            assert "[attached image: chart.png]" in text_part["text"]
+            
+            # Response should include the AI's analysis
+            assert "I can see the image" in result
+    
+    def test_dm_response_with_input_pdf(self):
+        """Test DM response handles user-uploaded PDFs (multimodal input)."""
+        def mock_downloader(path):
+            return b"%PDF-1.4" + b"\x00" * 50
+        
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            mock_result = MagicMock()
+            mock_result.final_output = "I've analyzed the PDF. It contains course notes on automata."
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].usage.input_tokens = 1000
+            mock_result.raw_responses[0].usage.output_tokens = 150
+            mock_result.raw_responses[0].usage.total_tokens = 1150
+            mock_result.raw_responses[0].output = []
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                vector_store_id="vs_123",
+                file_downloader=mock_downloader
+            )
+            
+            result = bot.get_dm_response(
+                "user@test.com", 
+                "Summarize this document: /user_uploads/2/f8/abc/notes.pdf",
+                user_name="Test User"
+            )
+            
+            # Verify Runner.run_sync was called with multimodal input
+            call_args = MockRunner.run_sync.call_args
+            agent_input = call_args[0][1]
+            
+            # Should be a list (multimodal input)
+            assert isinstance(agent_input, list)
+            assert len(agent_input) == 1
+            assert agent_input[0]["role"] == "user"
+            
+            content = agent_input[0]["content"]
+            # Should have text + file parts
+            assert any(c["type"] == "input_text" for c in content)
+            assert any(c["type"] == "input_file" for c in content)
+            
+            # Check the PDF was correctly formatted
+            pdf_part = next(c for c in content if c["type"] == "input_file")
+            assert pdf_part["filename"] == "notes.pdf"
+            assert pdf_part["file_data"].startswith("data:application/pdf;base64,")
+            
+            # The text part should have the cleaned message
+            text_part = next(c for c in content if c["type"] == "input_text")
+            assert "[attached document: notes.pdf]" in text_part["text"]
+            
+            # Response should include the AI's analysis
+            assert "I've analyzed the PDF" in result
+    
+    def test_dm_response_without_files_uses_string_input(self):
+        """Test DM response uses simple string input when no files present."""
+        with patch('chatgpt.OpenAIClient') as MockClient, \
+             patch('chatgpt.Runner') as MockRunner, \
+             patch('chatgpt.SQLiteSession'), \
+             patch('chatgpt.OpenAIResponsesCompactionSession') as MockSession:
+            
+            mock_client = MagicMock()
+            MockClient.return_value = mock_client
+            MockSession.return_value = MagicMock()
+            
+            mock_result = MagicMock()
+            mock_result.final_output = "Simple response"
+            mock_result.raw_responses = [MagicMock()]
+            mock_result.raw_responses[0].usage.input_tokens = 100
+            mock_result.raw_responses[0].usage.output_tokens = 50
+            mock_result.raw_responses[0].usage.total_tokens = 150
+            mock_result.raw_responses[0].output = []
+            MockRunner.run_sync.return_value = mock_result
+            
+            bot = ChatBot(
+                model="gpt-4o",
+                api_key="fake-key",
+                vector_store_id="vs_123"
+            )
+            
+            bot.get_dm_response("user@test.com", "Hello, no files here")
+            
+            # Verify Runner.run_sync was called with string input (not list)
+            call_args = MockRunner.run_sync.call_args
+            agent_input = call_args[0][1]
+            
+            assert isinstance(agent_input, str)
+            assert agent_input == "Hello, no files here"
