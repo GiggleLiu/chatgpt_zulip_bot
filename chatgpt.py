@@ -496,6 +496,9 @@ f(x) = x^2
 
 WRONG (DO NOT DO THIS):
 - `$$f(x)$$` - NO backticks around inline math!
+- $$
+f(x)
+$$ - NO block math with double dollars!
 - "function$$f(x)$$is" - NO missing spaces for inline!
 === END MATH FORMATTING ==="""
     
