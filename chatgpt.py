@@ -331,7 +331,6 @@ DO NOT use file_search for user uploads - file_search only searches the course m
 
 1. **file_search**: Search COURSE MATERIALS ONLY (lecture notes, assignments, etc. in the vector store).
    - Use for course-related questions about Theory of Computation topics
-   - Does NOT search user-uploaded files
 
 2. **web_search**: Search the web for current information, papers, documentation, or concepts not covered in course materials.
 
@@ -655,12 +654,33 @@ WRONG (DO NOT DO THIS):
         try:
             instructions = self._get_base_instructions() + """
 
+=== USER-UPLOADED FILES ===
+
+When users upload files (images, PDFs, documents), the content is provided DIRECTLY in the message.
+You can see and analyze uploaded files immediately - no tool is needed to access them.
+DO NOT use file_search for user uploads - file_search only searches the course materials database.
+
 You have access to course materials through the file_search tool. 
-Search for relevant content to answer the question accurately."""
+Search for relevant content to answer course-related questions accurately."""
+            
+            # Extract and process any files (images, PDFs) from the message
+            display_name = f"{sender_name} ({user_id})" if sender_name else user_id
+            cleaned_prompt, file_contents = self._extract_files_from_message(prompt, display_name)
+            
+            # Build input for the API
+            if file_contents:
+                # Multimodal input: list of content items
+                content_parts = [{"type": "input_text", "text": cleaned_prompt}]
+                content_parts.extend(file_contents)
+                api_input = [{"role": "user", "content": content_parts}]
+                logging.info(f"[{display_name}] Stream: Using multimodal input with {len(file_contents)} file(s)")
+            else:
+                # Simple text input
+                api_input = prompt
             
             response = self.client.responses.create(
                 model=self.model,
-                input=prompt,
+                input=api_input,
                 instructions=instructions,
                 max_output_tokens=self.max_output_tokens,
                 tools=[{
