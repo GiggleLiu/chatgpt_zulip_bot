@@ -321,19 +321,28 @@ class ChatBot:
         # Use identical instructions as stream mode for consistency
         instructions = self._get_base_instructions() + """
 
+=== USER-UPLOADED FILES ===
+
+When users upload files (images, PDFs, documents), the content is provided DIRECTLY in the message.
+You can see and analyze uploaded files immediately - no tool is needed to access them.
+DO NOT use file_search for user uploads - file_search only searches the course materials database.
+
 === AVAILABLE TOOLS ===
 
-1. **file_search**: Search course materials in the vector store. Use this first for course-related questions.
+1. **file_search**: Search COURSE MATERIALS ONLY (lecture notes, assignments, etc. in the vector store).
+   - Use for course-related questions about Theory of Computation topics
+   - Does NOT search user-uploaded files
 
 2. **web_search**: Search the web for current information, papers, documentation, or concepts not covered in course materials.
 
 3. **code_interpreter**: Execute Python code in a sandbox. Use this to:
    - Run automata simulations or regex examples
-   - Analyze files uploaded by students (PDFs, images, code files)
+   - Process or transform data from user uploads
    - Create visualizations or diagrams
    - Perform mathematical computations
 
-Always search course materials first. Use web search for supplementary information."""
+For course questions: use file_search first, then web_search if needed.
+For user uploads: analyze directly from the message content."""
         
         return Agent(
             name="Professor-GPT",
