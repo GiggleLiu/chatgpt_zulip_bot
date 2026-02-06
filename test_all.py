@@ -1266,3 +1266,327 @@ class TestFileInput:
             
             assert isinstance(agent_input, str)
             assert agent_input == "Hello, no files here"
+
+
+# =============================================================================
+# Claude Multimodal Tests
+# =============================================================================
+
+class TestClaudeFileInput:
+    """Tests for Claude multimodal input (images and PDFs)."""
+    
+    @pytest.fixture
+    def temp_db(self, tmp_path):
+        """Create a temporary database path for tests."""
+        return str(tmp_path / "test_claude.db")
+    
+    def test_claude_extract_files_no_downloader(self, temp_db):
+        """Test that no files are extracted when file_downloader is not set."""
+        from claude import ClaudeChatBot
+        with patch('claude.anthropic.Anthropic'):
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=None,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            message = "Check this image /user_uploads/2/f8/abc123/test.png please"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            assert cleaned == message  # Unchanged
+            assert files == []
+    
+    def test_claude_extract_files_with_image(self, temp_db):
+        """Test extracting an image URL from a message."""
+        from claude import ClaudeChatBot
+        downloaded_files = []
+        
+        def mock_downloader(path):
+            downloaded_files.append(path)
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        
+        with patch('claude.anthropic.Anthropic'):
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            message = "Check this image /user_uploads/2/f8/abc123/test.png please"
+            cleaned, files = bot._extract_files_from_message(message, "test_user")
+            
+            # Verify the file was downloaded
+            assert "/user_uploads/2/f8/abc123/test.png" in downloaded_files
+            
+            # Verify the message was cleaned
+            assert "[attached image: test.png]" in cleaned
+            assert "/user_uploads/" not in cleaned
+            
+            # Verify image content was extracted with Claude's format
+            assert len(files) == 1
+            assert files[0]["type"] == "image"
+            assert files[0]["source"]["type"] == "base64"
+            assert files[0]["source"]["media_type"] == "image/png"
+            assert "data" in files[0]["source"]  # base64 data
+    
+    def test_claude_extract_files_with_pdf(self, temp_db):
+        """Test extracting a PDF URL from a message."""
+        from claude import ClaudeChatBot
+        downloaded_files = []
+        
+        def mock_downloader(path):
+            downloaded_files.append(path)
+            return b"%PDF-1.4" + b"\x00" * 100
+        
+        with patch('claude.anthropic.Anthropic'):
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            message = "Check this document /user_uploads/2/f8/abc123/report.pdf please"
+            cleaned, files = bot._extract_files_from_message(message, "test_user")
+            
+            # Verify the file was downloaded
+            assert "/user_uploads/2/f8/abc123/report.pdf" in downloaded_files
+            
+            # Verify the message was cleaned
+            assert "[attached document: report.pdf]" in cleaned
+            assert "/user_uploads/" not in cleaned
+            
+            # Verify PDF content was extracted with Claude's document format
+            assert len(files) == 1
+            assert files[0]["type"] == "document"
+            assert files[0]["source"]["type"] == "base64"
+            assert files[0]["source"]["media_type"] == "application/pdf"
+            assert "data" in files[0]["source"]  # base64 data
+    
+    def test_claude_extract_files_mixed_image_and_pdf(self, temp_db):
+        """Test extracting both image and PDF from a message."""
+        from claude import ClaudeChatBot
+        
+        def mock_downloader(path):
+            if path.endswith('.pdf'):
+                return b"%PDF-1.4" + b"\x00" * 50
+            else:
+                return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('claude.anthropic.Anthropic'):
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            message = "Image: /user_uploads/2/a1/photo.png and PDF: /user_uploads/2/b2/doc.pdf"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # Both should be extracted
+            assert len(files) == 2
+            
+            # Check image
+            image_file = next(f for f in files if f["type"] == "image")
+            assert image_file["source"]["media_type"] == "image/png"
+            
+            # Check PDF
+            pdf_file = next(f for f in files if f["type"] == "document")
+            assert pdf_file["source"]["media_type"] == "application/pdf"
+            
+            # Check cleaned message
+            assert "[attached image: photo.png]" in cleaned
+            assert "[attached document: doc.pdf]" in cleaned
+    
+    def test_claude_extract_files_various_documents(self, temp_db):
+        """Test that Claude supports various document types (PDF, DOCX, TXT, etc.)."""
+        from claude import ClaudeChatBot
+        downloaded = []
+        
+        def mock_downloader(path):
+            downloaded.append(path)
+            return b"document content"
+        
+        with patch('claude.anthropic.Anthropic'):
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            # All document types should be processed
+            message = "Word: /user_uploads/2/a1/report.docx PDF: /user_uploads/2/a1/doc.pdf Image: /user_uploads/2/a1/img.png"
+            cleaned, files = bot._extract_files_from_message(message)
+            
+            # All three should be downloaded
+            assert "/user_uploads/2/a1/doc.pdf" in downloaded
+            assert "/user_uploads/2/a1/img.png" in downloaded
+            assert "/user_uploads/2/a1/report.docx" in downloaded
+            
+            # All three files should be extracted
+            assert len(files) == 3
+            
+            # Check document types
+            image_file = next(f for f in files if f["type"] == "image")
+            assert image_file["source"]["media_type"] == "image/png"
+            
+            pdf_file = next(f for f in files if f["source"]["media_type"] == "application/pdf")
+            assert pdf_file["type"] == "document"
+            
+            docx_file = next(f for f in files if "openxmlformats" in f["source"]["media_type"])
+            assert docx_file["type"] == "document"
+            
+            # All should be replaced in cleaned message
+            assert "[attached document: report.docx]" in cleaned
+            assert "[attached document: doc.pdf]" in cleaned
+            assert "[attached image: img.png]" in cleaned
+    
+    def test_claude_dm_response_with_image(self, temp_db):
+        """Test Claude DM response handles user-uploaded images."""
+        from claude import ClaudeChatBot
+        
+        def mock_downloader(path):
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('claude.anthropic.Anthropic') as MockAnthropic:
+            mock_client = MagicMock()
+            MockAnthropic.return_value = mock_client
+            
+            # Mock response
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text="I can see the image showing a DFA diagram.")]
+            mock_response.usage.input_tokens = 500
+            mock_response.usage.output_tokens = 100
+            mock_response.usage.cache_read_input_tokens = 0
+            mock_response.usage.cache_creation_input_tokens = 0
+            mock_client.messages.create.return_value = mock_response
+            
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            # Set a week so we can ask questions
+            bot._set_user_week("test@user.com", 1)
+            
+            result = bot.get_dm_response(
+                "test@user.com",
+                "What's in this image? /user_uploads/2/f8/abc/chart.png",
+                user_name="Test User"
+            )
+            
+            # Verify messages.create was called
+            call_kwargs = mock_client.messages.create.call_args.kwargs
+            messages = call_kwargs["messages"]
+            
+            # Should have at least the user message (history may also include assistant response)
+            assert len(messages) >= 1
+            
+            # Check the first message (user's multimodal input)
+            user_message = messages[0]
+            assert user_message["role"] == "user"
+            
+            content = user_message["content"]
+            # Should have text + image parts (list format)
+            assert isinstance(content, list)
+            assert any(c["type"] == "text" for c in content)
+            assert any(c["type"] == "image" for c in content)
+            
+            # Check image block format
+            image_part = next(c for c in content if c["type"] == "image")
+            assert image_part["source"]["type"] == "base64"
+            assert image_part["source"]["media_type"] == "image/png"
+            
+            # Response should include the AI's analysis
+            assert "I can see the image" in result
+    
+    def test_claude_dm_response_without_files_uses_string_content(self, temp_db):
+        """Test Claude DM response uses simple string content when no files present."""
+        from claude import ClaudeChatBot
+        
+        with patch('claude.anthropic.Anthropic') as MockAnthropic:
+            mock_client = MagicMock()
+            MockAnthropic.return_value = mock_client
+            
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text="Simple response")]
+            mock_response.usage.input_tokens = 100
+            mock_response.usage.output_tokens = 50
+            mock_response.usage.cache_read_input_tokens = 0
+            mock_response.usage.cache_creation_input_tokens = 0
+            mock_client.messages.create.return_value = mock_response
+            
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            bot._set_user_week("test@user.com", 1)
+            bot.get_dm_response("test@user.com", "Hello, no files here")
+            
+            # Verify messages.create was called with string content (not list)
+            call_kwargs = mock_client.messages.create.call_args.kwargs
+            messages = call_kwargs["messages"]
+            
+            assert messages[0]["role"] == "user"
+            assert messages[0]["content"] == "Hello, no files here"
+    
+    def test_claude_stream_response_with_image(self, temp_db):
+        """Test Claude stream response handles user-uploaded images."""
+        from claude import ClaudeChatBot
+        
+        def mock_downloader(path):
+            return b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        
+        with patch('claude.anthropic.Anthropic') as MockAnthropic:
+            mock_client = MagicMock()
+            MockAnthropic.return_value = mock_client
+            
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text="I see a diagram in the image.")]
+            mock_response.usage.input_tokens = 400
+            mock_response.usage.output_tokens = 80
+            mock_client.messages.create.return_value = mock_response
+            
+            bot = ClaudeChatBot(
+                model="claude-sonnet-4-5-20250929",
+                api_key="fake-key",
+                file_downloader=mock_downloader,
+                session_db_path=temp_db,
+                enable_web_search=False,
+            )
+            
+            result = bot.get_stream_response(
+                "test@user.com",
+                "What's this? /user_uploads/2/a1/diagram.png",
+                sender_name="Test User",
+                sender_id=123
+            )
+            
+            # Verify messages.create was called with multimodal content
+            call_kwargs = mock_client.messages.create.call_args.kwargs
+            messages = call_kwargs["messages"]
+            
+            assert len(messages) == 1
+            content = messages[0]["content"]
+            assert isinstance(content, list)
+            assert any(c["type"] == "text" for c in content)
+            assert any(c["type"] == "image" for c in content)
+            
+            # Response should have mention, quote, and AI response
+            assert "@_**Test User|123**" in result
+            assert "I see a diagram" in result

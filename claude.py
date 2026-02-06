@@ -3,8 +3,8 @@
 Claude-powered course assistant for DSAA3071 Theory of Computation.
 
 Two modes:
-- STREAM (public): No course materials, answers from general knowledge (~1K tokens)
-- DM (private): Week-based context with prompt caching (~6K tokens)
+- STREAM (public): Web search enabled, no course materials (~1K tokens)
+- DM (private): Week-based context with prompt caching, web search, SQLite persistence
 
 DM Flow:
 1. Student DMs the bot
@@ -16,18 +16,31 @@ DM Flow:
 Commands (DM only):
 - /week N  - Select which week to study (e.g., /week 3)
 - /reset   - Clear conversation and week selection
+
+Features:
+- Web Search: Built-in tool for real-time information
+- Multimodal: Images (PNG, JPEG, GIF, WebP) and documents (PDF, DOCX, etc.)
+- SQLite Persistence: Conversation history stored in database
 """
 
 import anthropic
+import base64
+import json
 import logging
 import os
 import re
+import sqlite3
+from typing import Callable, Optional
 
 from chatgpt import (
     load_course_materials, 
     match_file_pattern, 
     extract_text_content,
-    RESET_PATTERN
+    RESET_PATTERN,
+    ZULIP_FILE_URL_PATTERN,
+    IMAGE_EXTENSIONS,
+    DOCUMENT_EXTENSIONS,
+    DOCUMENT_MIME_TYPES,
 )
 
 # Command patterns
@@ -95,16 +108,92 @@ def get_claude_model_specs(model: str) -> tuple[int, int]:
 
 
 # =============================================================================
+# SQLite Session Storage (like OpenAI's SQLiteSession)
+# =============================================================================
+
+class ClaudeSQLiteSession:
+    """SQLite-based session storage for Claude conversations."""
+    
+    def __init__(self, db_path: str = "claude_conversations.db"):
+        """Initialize the SQLite session storage."""
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Create the database tables if they don't exist."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    user_id TEXT PRIMARY KEY,
+                    messages TEXT,
+                    week_num INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+    
+    def get_session(self, user_id: str) -> tuple[list, int | None]:
+        """Get conversation history and week number for a user."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT messages, week_num FROM conversations WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                messages = json.loads(row[0]) if row[0] else []
+                week_num = row[1]
+                return messages, week_num
+            return [], None
+    
+    def save_session(self, user_id: str, messages: list, week_num: int | None):
+        """Save conversation history and week number for a user."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO conversations (user_id, messages, week_num, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, json.dumps(messages), week_num))
+            conn.commit()
+    
+    def clear_session(self, user_id: str):
+        """Clear a user's session."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+            conn.commit()
+    
+    def get_week(self, user_id: str) -> int | None:
+        """Get only the week number for a user."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT week_num FROM conversations WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+    
+    def set_week(self, user_id: str, week_num: int):
+        """Set only the week number for a user (clears messages)."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO conversations (user_id, messages, week_num, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, json.dumps([]), week_num))
+            conn.commit()
+
+
+# =============================================================================
 # ClaudeChatBot Class
 # =============================================================================
 
 class ClaudeChatBot:
     """
-    Claude-powered chatbot with week-based context loading and prompt caching.
+    Claude-powered chatbot with web search, multimodal support, and SQLite persistence.
     
-    Students select which week to study with /week N command.
-    Only that week's materials are loaded (~6K tokens instead of 80K).
-    Prompt caching reduces costs by ~90% for follow-up questions.
+    Features:
+    - Web search tool for real-time information
+    - Multimodal input (images, PDFs, documents)
+    - SQLite-based conversation persistence
+    - Week-based context loading with prompt caching
     
     Commands:
     - /week N  - Set current week (e.g., /week 3)
@@ -119,6 +208,9 @@ class ClaudeChatBot:
         file_patterns: list = None,
         max_output_tokens: int = None,
         log_qa: bool = False,
+        file_downloader: Optional[Callable[[str], bytes | None]] = None,
+        session_db_path: str = "claude_conversations.db",
+        enable_web_search: bool = True,
         **kwargs  # Accept but ignore OpenAI-specific args like vector_store_id
     ):
         """
@@ -131,15 +223,23 @@ class ClaudeChatBot:
             file_patterns: Patterns to filter course files
             max_output_tokens: Override for max output tokens
             log_qa: Whether to log each Q&A pair
+            file_downloader: Callback to download files from Zulip
+            session_db_path: Path to SQLite database for session storage
+            enable_web_search: Whether to enable the web search tool
         """
         self.model = model
         self.client = anthropic.Anthropic(api_key=api_key)
+        self.file_downloader = file_downloader
+        self.enable_web_search = enable_web_search
         
         _, default_max_output = get_claude_model_specs(model)
         self.max_output_tokens = max_output_tokens or default_max_output
         
         self.log_qa = log_qa
         self.file_patterns = file_patterns or []
+        
+        # SQLite session storage (like OpenAI's SQLiteSession)
+        self.session = ClaudeSQLiteSession(session_db_path)
         
         # Load course materials (organized by week)
         self.course_materials = load_course_materials(course_dir)
@@ -150,10 +250,6 @@ class ClaudeChatBot:
         # Legacy: full course context (for stream mode fallback)
         self.course_context = self._prepare_course_context()
         
-        # Per-user state
-        self.conversations = {}  # user_id -> list of messages
-        self.user_weeks = {}     # user_id -> current week number
-        
         # Available weeks
         self.available_weeks = sorted([
             int(k.replace('week', '')) 
@@ -162,6 +258,8 @@ class ClaudeChatBot:
         ])
         
         logging.info(f"ClaudeChatBot initialized: model={model}")
+        logging.info(f"Web search: {'enabled' if enable_web_search else 'disabled'}")
+        logging.info(f"Session DB: {session_db_path}")
         logging.info(f"Available weeks: {self.available_weeks}")
         logging.info(f"Week contexts prepared: {list(self.week_contexts.keys())}")
     
@@ -224,9 +322,117 @@ class ClaudeChatBot:
             return self.week_contexts[week_num]
         return ""
     
+    def _extract_files_from_message(self, message: str, user_display: str = None) -> tuple[str, list[dict]]:
+        """Extract Zulip file URLs from a message and download them.
+        
+        Supports images (PNG, JPEG, GIF, WebP) and documents (PDF, DOCX, TXT, etc.).
+        
+        Claude uses different content block formats:
+        - Images: {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+        - Documents: {"type": "document", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+        
+        Returns:
+            tuple: (cleaned_message, list of content blocks for multimodal input)
+        """
+        if not self.file_downloader:
+            return message, []
+        
+        # Find all Zulip file URLs in the message
+        file_urls = ZULIP_FILE_URL_PATTERN.findall(message)
+        if not file_urls:
+            return message, []
+        
+        file_contents = []
+        cleaned_message = message
+        
+        for file_url in file_urls:
+            ext = os.path.splitext(file_url)[1].lower()
+            filename = os.path.basename(file_url)
+            
+            # Check if it's a supported file type
+            is_image = ext in IMAGE_EXTENSIONS
+            is_document = ext in DOCUMENT_EXTENSIONS
+            
+            if not is_image and not is_document:
+                logging.info(f"[{user_display}] Skipping unsupported file type: {file_url}")
+                continue
+            
+            # Download the file
+            try:
+                file_bytes = self.file_downloader(file_url)
+                if file_bytes:
+                    b64_data = base64.b64encode(file_bytes).decode('utf-8')
+                    
+                    if is_image:
+                        # Images use image content block
+                        mime_type = {
+                            '.png': 'image/png',
+                            '.jpg': 'image/jpeg',
+                            '.jpeg': 'image/jpeg',
+                            '.gif': 'image/gif',
+                            '.webp': 'image/webp',
+                        }.get(ext, 'image/png')
+                        
+                        file_contents.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": b64_data,
+                            }
+                        })
+                        file_type_label = "image"
+                    else:
+                        # Documents use document content block
+                        mime_type = DOCUMENT_MIME_TYPES.get(ext, 'application/octet-stream')
+                        
+                        file_contents.append({
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": b64_data,
+                            }
+                        })
+                        file_type_label = "document"
+                    
+                    logging.info(f"[{user_display}] Downloaded and encoded {file_type_label}: {file_url} ({len(file_bytes)} bytes)")
+                    
+                    # Remove the URL from the message to avoid confusion
+                    cleaned_message = cleaned_message.replace(file_url, f"[attached {file_type_label}: {filename}]")
+                else:
+                    logging.warning(f"[{user_display}] Failed to download file: {file_url}")
+            except Exception as e:
+                logging.error(f"[{user_display}] Error processing file {file_url}: {e}")
+        
+        return cleaned_message, file_contents
+    
+    def _get_tools(self) -> list:
+        """Get the list of tools to enable."""
+        tools = []
+        if self.enable_web_search:
+            tools.append({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 3,  # Allow up to 3 searches per response
+            })
+        return tools if tools else None
+    
     def _get_base_instructions(self) -> str:
         """Base instructions for the AI assistant."""
-        return """You are a university professor teaching DSAA3071 Theory of Computation at HKUST(GZ).
+        web_search_instructions = """
+
+=== WEB SEARCH TOOL ===
+
+You have access to a web search tool. Use it when:
+- Questions require current/recent information not in course materials
+- Students ask about recent papers, news, or developments
+- You need to verify or supplement your knowledge
+- Questions go beyond the course scope and would benefit from web sources
+
+When using web search results, always cite your sources.""" if self.enable_web_search else ""
+        
+        return f"""You are a university professor teaching DSAA3071 Theory of Computation at HKUST(GZ).
 
 === ACCURACY IS YOUR TOP PRIORITY ===
 
@@ -252,7 +458,13 @@ As a professor, you occasionally:
 
 When a student asks about something NOT covered in the course materials:
 - First check if it's a general theory of computation topic (answer from knowledge, but note it's beyond course scope)
-- For current events, recent research, or things that require up-to-date information, acknowledge you may not have the latest information
+- For current events, recent research, or things that require up-to-date information, use web search if available
+{web_search_instructions}
+
+=== USER-UPLOADED FILES ===
+
+When users upload files (images, PDFs, documents), the content is provided DIRECTLY in the message.
+You can see and analyze uploaded files immediately.
 
 === MATH FORMATTING FOR ZULIP ===
 
@@ -276,35 +488,6 @@ WRONG (DO NOT DO THIS):
 - "function$$f(x)$$is" - NO missing spaces for inline!
 === END MATH FORMATTING ==="""
 
-    def _get_system_prompt(self, week_num: int = None) -> str:
-        """Build system prompt with course materials embedded."""
-        base = self._get_base_instructions()
-        
-        if week_num and week_num in self.week_contexts:
-            # Week-specific context (efficient)
-            context = self.week_contexts[week_num]
-            return f"""{base}
-
-=== WEEK {week_num} COURSE MATERIALS ===
-You are currently helping a student with Week {week_num} content.
-Use these materials to answer their questions accurately.
-
-{context}
-
-=== END COURSE MATERIALS ==="""
-        elif self.course_context:
-            # Full course context (fallback for stream mode)
-            return f"""{base}
-
-=== COURSE MATERIALS ===
-Below are the course materials. Use these to answer student questions accurately.
-
-{self.course_context}
-
-=== END COURSE MATERIALS ==="""
-        else:
-            return base
-    
     def _get_system_messages(self, week_num: int = None) -> list:
         """Build system messages with prompt caching enabled."""
         base = self._get_base_instructions()
@@ -393,6 +576,14 @@ Below are the course materials. Use these to answer student questions accurately
             f"= {total_tokens:,}"
         )
     
+    def _extract_text_from_response(self, response) -> str:
+        """Extract text content from a Claude response, handling tool use."""
+        text_parts = []
+        for block in response.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        return "\n".join(text_parts) if text_parts else ""
+    
     def get_stream_response(
         self, 
         user_id: str, 
@@ -403,18 +594,20 @@ Below are the course materials. Use these to answer student questions accurately
         message_url: str = None
     ) -> str:
         """
-        Handle stream message: NO course materials loaded.
+        Handle stream message: Web search enabled, no course materials.
         
-        Stream mode uses only the base instructions (no textbook context).
-        This keeps costs low for public channel questions.
+        Stream mode uses base instructions with web search tool.
         For course-specific questions, students should DM with /week N.
+        
+        Supports multimodal input (images, PDFs) from Zulip uploads.
         """
-        logging.info(f"Stream message from {user_id} (no course context)")
+        display_name = f"{sender_name} ({user_id})" if sender_name else user_id
+        logging.info(f"Stream message from {display_name}")
         
         quote_text = original_message if original_message else prompt
         
         try:
-            # Use only base instructions - NO course materials
+            # Use base instructions with web search note
             system_prompt = self._get_base_instructions() + """
 
 NOTE: You do NOT have access to course materials in this mode.
@@ -422,14 +615,39 @@ For general theory of computation questions, answer from your knowledge.
 For course-specific questions (homework, specific lecture content), 
 suggest the student DM you with /week N to load the relevant materials."""
             
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_output_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            # Extract and process any files (images, PDFs) from the message
+            cleaned_prompt, file_contents = self._extract_files_from_message(prompt, display_name)
             
-            reply = response.content[0].text
+            # Build message content
+            if file_contents:
+                # Multimodal input: list of content blocks
+                content_parts = [{"type": "text", "text": cleaned_prompt}]
+                content_parts.extend(file_contents)
+                messages = [{"role": "user", "content": content_parts}]
+                logging.info(f"[{display_name}] Stream: Using multimodal input with {len(file_contents)} file(s)")
+            else:
+                # Simple text input
+                messages = [{"role": "user", "content": prompt}]
+            
+            # Build request kwargs
+            request_kwargs = {
+                "model": self.model,
+                "max_tokens": self.max_output_tokens,
+                "system": system_prompt,
+                "messages": messages,
+            }
+            
+            # Add tools if enabled
+            tools = self._get_tools()
+            if tools:
+                request_kwargs["tools"] = tools
+            
+            response = self.client.messages.create(**request_kwargs)
+            
+            reply = self._extract_text_from_response(response)
+            if not reply:
+                reply = "I couldn't generate a response."
+            
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
             
@@ -451,22 +669,30 @@ suggest the student DM you with /week N to load the relevant materials."""
                 mention = ""
             return mention + self._quote_message(quote_text) + f"\n\nError: {str(e)}"
     
-    def get_dm_response(self, user_id: str, prompt: str) -> str:
+    def get_dm_response(self, user_id: str, prompt: str, user_name: str = None) -> str:
         """
-        Handle DM message with week-based context and prompt caching.
+        Handle DM message with week-based context, web search, and SQLite persistence.
         
         Commands:
         - /week N  - Set current week (loads only that week's materials)
         - /reset   - Clear conversation and week selection
+        
+        Supports multimodal input (images, PDFs) from Zulip uploads.
+        
+        Args:
+            user_id: User identifier (email)
+            prompt: The user's message
+            user_name: Optional display name for logging
         """
-        logging.info(f"DM message from {user_id}")
+        display_name = f"{user_name} ({user_id})" if user_name else user_id
+        logging.info(f"DM message from {display_name}")
         
         prompt_stripped = prompt.strip()
         
         # Handle /reset command
         if RESET_PATTERN.match(prompt_stripped):
             self.clear_user_session(user_id)
-            return "✅ Conversation cleared. Use `/week N` to select a week to study."
+            return "Conversation cleared. Use `/week N` to select a week to study."
         
         # Handle /week N command
         week_match = WEEK_PATTERN.match(prompt_stripped)
@@ -474,8 +700,10 @@ suggest the student DM you with /week N to load the relevant materials."""
             week_num = int(week_match.group(1))
             return self._set_user_week(user_id, week_num)
         
+        # Get session from SQLite
+        history, current_week = self.session.get_session(user_id)
+        
         # Check if user has selected a week
-        current_week = self.user_weeks.get(user_id)
         if current_week is None:
             # Prompt user to select a week with topics
             weeks_table = "\n".join([
@@ -483,32 +711,51 @@ suggest the student DM you with /week N to load the relevant materials."""
                 for w in self.available_weeks
             ])
             return (
-                f"👋 Welcome! Please select which week you want to study.\n\n"
+                f"Welcome! Please select which week you want to study.\n\n"
                 f"**Available weeks:**\n{weeks_table}\n\n"
                 f"**Command:** `/week N` (e.g., `/week 3` for Week 3)\n\n"
                 f"Once you select a week, I'll load the relevant course materials and help you learn!"
             )
         
         try:
-            # Get or create conversation history
-            if user_id not in self.conversations:
-                self.conversations[user_id] = []
-                logging.info(f"Created new conversation for user {user_id}")
+            # Extract and process any files (images, PDFs) from the message
+            cleaned_prompt, file_contents = self._extract_files_from_message(prompt, display_name)
             
-            history = self.conversations[user_id]
-            history.append({"role": "user", "content": prompt})
+            # Build message content
+            if file_contents:
+                # Multimodal input: list of content blocks
+                content_parts = [{"type": "text", "text": cleaned_prompt}]
+                content_parts.extend(file_contents)
+                user_message = {"role": "user", "content": content_parts}
+                logging.info(f"[{display_name}] DM: Using multimodal input with {len(file_contents)} file(s)")
+            else:
+                # Simple text input
+                user_message = {"role": "user", "content": prompt}
+            
+            history.append(user_message)
             
             # Use system messages with caching for efficiency
             system_messages = self._get_system_messages(current_week)
             
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_output_tokens,
-                system=system_messages,
-                messages=history,
-            )
+            # Build request kwargs
+            request_kwargs = {
+                "model": self.model,
+                "max_tokens": self.max_output_tokens,
+                "system": system_messages,
+                "messages": history,
+            }
             
-            reply = response.content[0].text
+            # Add tools if enabled
+            tools = self._get_tools()
+            if tools:
+                request_kwargs["tools"] = tools
+            
+            response = self.client.messages.create(**request_kwargs)
+            
+            reply = self._extract_text_from_response(response)
+            if not reply:
+                reply = "I couldn't generate a response."
+            
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
             
@@ -520,13 +767,16 @@ suggest the student DM you with /week N to load the relevant materials."""
             history.append({"role": "assistant", "content": reply})
             
             # Trim history if it gets too long (keep last 5 exchanges for cost efficiency)
-            max_history = 10  # 5 user + 5 assistant messages (~57% cost savings)
+            max_history = 10  # 5 user + 5 assistant messages
             if len(history) > max_history:
-                self.conversations[user_id] = history[-max_history:]
+                history = history[-max_history:]
                 logging.info(f"Trimmed conversation history for {user_id}")
             
+            # Save to SQLite
+            self.session.save_session(user_id, history, current_week)
+            
             if self.log_qa:
-                logging.info(f"[DM Q&A] User={user_id} Week={current_week}\nQ: {prompt}\nA: {reply}")
+                logging.info(f"[DM Q&A] User={display_name} Week={current_week}\nQ: {prompt}\nA: {reply}")
             
             return self._format_dm_response_with_cache(
                 reply, input_tokens, output_tokens, 
@@ -541,24 +791,21 @@ suggest the student DM you with /week N to load the relevant materials."""
         """Set the current week for a user."""
         if week_num not in self.available_weeks:
             weeks_list = ", ".join(str(w) for w in self.available_weeks)
-            return f"❌ Week {week_num} not found. Available weeks: {weeks_list}"
+            return f"Week {week_num} not found. Available weeks: {weeks_list}"
         
-        old_week = self.user_weeks.get(user_id)
-        self.user_weeks[user_id] = week_num
-        
-        # Clear conversation when switching weeks
-        if old_week != week_num and user_id in self.conversations:
-            del self.conversations[user_id]
-            logging.info(f"Cleared conversation for {user_id} due to week change")
+        # Set week and clear conversation (via SQLite)
+        self.session.set_week(user_id, week_num)
         
         context_size = len(self.week_contexts.get(week_num, ""))
         topic = WEEK_TOPICS.get(week_num, "Course materials")
         logging.info(f"User {user_id} set to week {week_num} ({context_size:,} chars)")
         
+        web_search_note = "\n\n_I also have web search enabled for questions that go beyond the course materials._" if self.enable_web_search else ""
+        
         return (
-            f"✅ **Week {week_num}: {topic}**\n\n"
+            f"**Week {week_num}: {topic}**\n\n"
             f"I've loaded the Week {week_num} course materials ({context_size:,} characters).\n"
-            f"Ask me anything about this week's topics!\n\n"
+            f"Ask me anything about this week's topics!{web_search_note}\n\n"
             f"_Tip: Use `/reset` to clear our conversation, or `/week N` to switch weeks._"
         )
     
@@ -572,11 +819,9 @@ suggest the student DM you with /week N to load the relevant materials."""
         # Calculate savings if cache was used
         cache_info = ""
         if cache_read > 0:
-            # Cache read tokens cost 10% of normal
-            savings = cache_read * 0.9  # 90% savings on cached tokens
-            cache_info = f" | 📦 Cache: {cache_read:,} tokens (saved ~90%)"
+            cache_info = f" | Cache: {cache_read:,} tokens (saved ~90%)"
         elif cache_write > 0:
-            cache_info = f" | 📝 Cached: {cache_write:,} tokens"
+            cache_info = f" | Cached: {cache_write:,} tokens"
         
         return (
             f"{reply}\n"
@@ -586,8 +831,5 @@ suggest the student DM you with /week N to load the relevant materials."""
     
     def clear_user_session(self, user_id: str):
         """Clear a user's conversation history and week selection."""
-        if user_id in self.conversations:
-            del self.conversations[user_id]
-        if user_id in self.user_weeks:
-            del self.user_weeks[user_id]
+        self.session.clear_session(user_id)
         logging.info(f"Cleared session for user {user_id}")

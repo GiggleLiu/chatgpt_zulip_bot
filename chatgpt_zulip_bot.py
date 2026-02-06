@@ -1,11 +1,12 @@
 # chatgpt_zulip_bot.py
 """
-Zulip bot that integrates with OpenAI or Claude for course assistance.
+Zulip bot that integrates with OpenAI, Claude, or Qwen for course assistance.
 Restricted to specific streams and their members.
 
-Supports two backends:
+Supports three backends:
 - OpenAI: Uses Agents SDK with RAG (vector store search)
 - Claude: Uses context stuffing (all materials in prompt)
+- Qwen: Uses native DashScope SDK with week-based context
 """
 
 import zulip
@@ -16,6 +17,8 @@ from configparser import ConfigParser
 
 from chatgpt import ChatBot
 from claude import ClaudeChatBot
+from qwen import QwenChatBot
+from qwen import QwenChatBot
 
 
 class ChatGPTZulipBot(zulip.Client):
@@ -239,10 +242,98 @@ def serve(config_file: str = "config.ini"):
     if allowed_streams_str:
         allowed_streams = [s.strip() for s in allowed_streams_str.split(",") if s.strip()]
     
+    # Create Zulip client for file operations (used by both backends)
+    temp_zulip = zulip.Client(config_file=zulip_config)
+    
+    def upload_file_to_zulip(filename: str, content: bytes) -> str:
+        """Upload a file to Zulip and return the URL.
+        
+        Uses Zulip's upload_file API. The response includes:
+        - url: The URL of the uploaded file (preferred, new in Zulip 9.0)
+        - uri: Legacy alias for url (deprecated)
+        - filename: The stored filename (may differ from input)
+        """
+        import io
+        # Create a file-like object from bytes
+        file_obj = io.BytesIO(content)
+        file_obj.name = filename
+        
+        result = temp_zulip.upload_file(file_obj)
+        if result.get("result") == "success":
+            # Use 'url' (preferred) with 'uri' as fallback for older servers
+            return result.get("url") or result.get("uri", "")
+        else:
+            logging.error(f"Zulip upload failed: {result}")
+            return ""
+    
+    def download_file_from_zulip(file_path: str) -> bytes | None:
+        """Download a file from Zulip given its path (e.g., /user_uploads/2/xx/file.png).
+        
+        Uses Zulip's API to get a temporary public URL, then downloads the content.
+        Returns the file bytes or None on failure.
+        """
+        import requests
+        
+        # The file_path should be like /user_uploads/{realm_id}/{filename_path}
+        # We need to call GET /api/v1/user_uploads/{realm_id}/{filename_path}
+        # to get a temporary URL
+        
+        if not file_path.startswith("/user_uploads/"):
+            logging.warning(f"Invalid Zulip file path: {file_path}")
+            return None
+        
+        # Extract the path after /user_uploads/
+        # e.g., "/user_uploads/2/f8/xxx/file.png" -> "2/f8/xxx/file.png"
+        relative_path = file_path[len("/user_uploads/"):]
+        
+        try:
+            # Get temporary URL using Zulip's API
+            # Use call_endpoint for custom API calls
+            result = temp_zulip.call_endpoint(
+                url=f"/user_uploads/{relative_path}",
+                method="GET",
+            )
+            
+            if result.get("result") != "success":
+                logging.error(f"Failed to get temporary URL for {file_path}: {result}")
+                return None
+            
+            temp_url = result.get("url")
+            if not temp_url:
+                logging.error(f"No URL in response for {file_path}: {result}")
+                return None
+            
+            # The temp_url is relative (starts with /user_uploads/temporary/...)
+            # We need to make it absolute using the Zulip server base URL
+            # Note: temp_zulip.base_url is the API URL (e.g., https://server/api/v1)
+            # We need the server URL without /api/v1
+            base_url = temp_zulip.base_url.rstrip("/")
+            # Strip /api/v1 or /api from the end to get the server URL
+            if base_url.endswith("/api/v1"):
+                server_url = base_url[:-7]  # Remove /api/v1
+            elif base_url.endswith("/api"):
+                server_url = base_url[:-4]  # Remove /api
+            else:
+                server_url = base_url
+            full_url = f"{server_url}{temp_url}"
+            
+            # Download the file (no auth needed for temporary URL)
+            response = requests.get(full_url, timeout=30)
+            response.raise_for_status()
+            
+            logging.info(f"Downloaded file from Zulip: {file_path} ({len(response.content)} bytes)")
+            return response.content
+            
+        except Exception as e:
+            logging.error(f"Error downloading file from Zulip {file_path}: {e}")
+            return None
+    
     # Initialize chatbot based on backend
     if backend == "claude":
-        # Claude backend: context stuffing (no vector store needed)
+        # Claude backend: context stuffing with web search
         api_key = settings["ANTHROPIC_API_KEY"]
+        session_db_path = settings.get("SESSION_DB_PATH", "claude_conversations.db")
+        enable_web_search = settings.get("ENABLE_WEB_SEARCH", "true").lower() in ("true", "1", "yes")
         
         chatbot = ClaudeChatBot(
             model=model,
@@ -251,105 +342,44 @@ def serve(config_file: str = "config.ini"):
             file_patterns=file_patterns,
             max_output_tokens=max_output_tokens,
             log_qa=log_qa,
+            file_downloader=download_file_from_zulip,
+            session_db_path=session_db_path,
+            enable_web_search=enable_web_search,
         )
         
         # Print startup info for Claude
         print(f"Claude bot starting (model: {model})")
-        print(f"  Backend: Claude (context stuffing)")
+        print(f"  Backend: Claude (context stuffing + web search)")
         print(f"  Course context: {len(chatbot.course_context):,} chars")
+        print(f"  Web search: {'enabled' if enable_web_search else 'disabled'}")
+        print(f"  Multimodal: images, PDFs, documents")
+        print(f"  Session DB: {session_db_path}")
+        print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
+    elif backend == "qwen":
+        # Qwen backend: native DashScope SDK with week-based context
+        api_key = settings["DASHSCOPE_API_KEY"]
+        
+        chatbot = QwenChatBot(
+            model=model,
+            api_key=api_key,
+            course_dir=course_dir,
+            file_patterns=file_patterns,
+            max_output_tokens=max_output_tokens,
+            log_qa=log_qa,
+            file_downloader=download_file_from_zulip,
+        )
+        
+        # Print startup info for Qwen
+        print(f"Qwen bot starting (model: {model})")
+        print(f"  Backend: Qwen (DashScope SDK)")
+        print(f"  Course context: {len(chatbot.course_context):,} chars")
+        print(f"  Vision model: {chatbot.is_vision_model}")
         print(f"  Q&A logging: {'enabled' if log_qa else 'disabled'}")
     else:
         # OpenAI backend: RAG with vector store
         api_key = settings["OPENAI_API_KEY"]
         vector_store_id = settings.get("VECTOR_STORE_ID")
         session_db_path = settings.get("SESSION_DB_PATH", "conversations.db")
-        
-        # Create a temporary Zulip client for file uploads
-        # (will be replaced with the actual bot client after initialization)
-        temp_zulip = zulip.Client(config_file=zulip_config)
-        
-        def upload_file_to_zulip(filename: str, content: bytes) -> str:
-            """Upload a file to Zulip and return the URL.
-            
-            Uses Zulip's upload_file API. The response includes:
-            - url: The URL of the uploaded file (preferred, new in Zulip 9.0)
-            - uri: Legacy alias for url (deprecated)
-            - filename: The stored filename (may differ from input)
-            """
-            import io
-            # Create a file-like object from bytes
-            file_obj = io.BytesIO(content)
-            file_obj.name = filename
-            
-            result = temp_zulip.upload_file(file_obj)
-            if result.get("result") == "success":
-                # Use 'url' (preferred) with 'uri' as fallback for older servers
-                return result.get("url") or result.get("uri", "")
-            else:
-                logging.error(f"Zulip upload failed: {result}")
-                return ""
-        
-        def download_file_from_zulip(file_path: str) -> bytes | None:
-            """Download a file from Zulip given its path (e.g., /user_uploads/2/xx/file.png).
-            
-            Uses Zulip's API to get a temporary public URL, then downloads the content.
-            Returns the file bytes or None on failure.
-            """
-            import requests
-            
-            # The file_path should be like /user_uploads/{realm_id}/{filename_path}
-            # We need to call GET /api/v1/user_uploads/{realm_id}/{filename_path}
-            # to get a temporary URL
-            
-            if not file_path.startswith("/user_uploads/"):
-                logging.warning(f"Invalid Zulip file path: {file_path}")
-                return None
-            
-            # Extract the path after /user_uploads/
-            # e.g., "/user_uploads/2/f8/xxx/file.png" -> "2/f8/xxx/file.png"
-            relative_path = file_path[len("/user_uploads/"):]
-            
-            try:
-                # Get temporary URL using Zulip's API
-                # Use call_endpoint for custom API calls
-                result = temp_zulip.call_endpoint(
-                    url=f"/user_uploads/{relative_path}",
-                    method="GET",
-                )
-                
-                if result.get("result") != "success":
-                    logging.error(f"Failed to get temporary URL for {file_path}: {result}")
-                    return None
-                
-                temp_url = result.get("url")
-                if not temp_url:
-                    logging.error(f"No URL in response for {file_path}: {result}")
-                    return None
-                
-                # The temp_url is relative (starts with /user_uploads/temporary/...)
-                # We need to make it absolute using the Zulip server base URL
-                # Note: temp_zulip.base_url is the API URL (e.g., https://server/api/v1)
-                # We need the server URL without /api/v1
-                base_url = temp_zulip.base_url.rstrip("/")
-                # Strip /api/v1 or /api from the end to get the server URL
-                if base_url.endswith("/api/v1"):
-                    server_url = base_url[:-7]  # Remove /api/v1
-                elif base_url.endswith("/api"):
-                    server_url = base_url[:-4]  # Remove /api
-                else:
-                    server_url = base_url
-                full_url = f"{server_url}{temp_url}"
-                
-                # Download the file (no auth needed for temporary URL)
-                response = requests.get(full_url, timeout=30)
-                response.raise_for_status()
-                
-                logging.info(f"Downloaded file from Zulip: {file_path} ({len(response.content)} bytes)")
-                return response.content
-                
-            except Exception as e:
-                logging.error(f"Error downloading file from Zulip {file_path}: {e}")
-                return None
         
         chatbot = ChatBot(
             model=model,
